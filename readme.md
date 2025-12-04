@@ -1,143 +1,95 @@
-# Gorse + Flask + MongoDB + Redis Production Setup
+# Gorse + Flask + MongoDB + Redis Recommendation Engine 🚀
 
-This repository contains a Gorse recommendation system using **Gorse**, **MongoDB**, **Redis**, and **Flask**.
-
----
-
-## **1. Prerequisites**
-
-- Docker & Docker Compose
-- Python 3.10+
-- pip
+This repository contains a full setup of a recommendation engine using **Gorse** (the core recommender engine), along with a **Flask** application, **MongoDB** (for items/users storage), **MySQL**, and **Redis** — all configured via Docker Compose.  
+It lets you add users/items, log feedback/activity, fetch personalized recommendations, and run a web-service around that.
 
 ---
 
-## **2. Docker Containers**
+## 📦 Features / What this repo provides
 
-We will run the following services:
-
-| Service     | Port     | Notes                           |
-|------------|---------|--------------------------------|
-| MySQL      | 3306    | For Gorse metadata             |
-| Redis      | 6379    | Cache and trending items       |
-| Gorse Master | 8086   | Gorse recommendation engine    |
-| Gorse Server | 8087   | Gorse API server               |
-| Gorse Dashboard | 8088| Gorse UI                       |
-| MongoDB    | 27017   | User activity & items database |
+- Full production-ready stack with Docker Compose  
+- RESTful endpoints to:  
+  - Add users & items  
+  - Submit feedback & user activity  
+  - Return recommendations per user  
+- Use of MongoDB for storing user/content data  
+- MySQL (or other DB) + Gorse for metadata, recommendation training, and serving  
+- Redis for caching / trending items / faster recommendation serving  
+- Configurable via `config.toml`, Flask settings or environment variables  
 
 ---
 
-## **3. Docker Compose Example**
+## 🧰 Prerequisites
 
-```yaml
-version: "3.8"
+- Docker & Docker Compose installed  
+- Python 3.10+  
+- `pip` (for installing Flask-app dependencies)
 
-services:
-  gorse-mysql:
-    image: mysql:8
-    container_name: gorse-mysql
-    environment:
-      MYSQL_ROOT_PASSWORD: gorse_pass
-      MYSQL_DATABASE: gorse
-      MYSQL_USER: gorse_user
-      MYSQL_PASSWORD: gorse_pass
-    ports:
-      - "3306:3306"
-    volumes:
-      - gorse-mysql-data:/var/lib/mysql
+---
 
-  gorse-redis:
-    image: redis:6
-    container_name: gorse-redis
-    ports:
-      - "6379:6379"
+## 🐳 Docker Compose Setup (Services & Ports)
 
-  gorse-master:
-    image: go-gorse/gorse:latest
-    container_name: gorse-master
-    depends_on:
-      - gorse-mysql
-      - gorse-redis
-    ports:
-      - "8086:8086"
-      - "8088:8088"
-    volumes:
-      - ./config.toml:/etc/gorse/config.toml
+The following services get created via `docker-compose.yml`:
 
-  gorse-server:
-    image: go-gorse/gorse:latest
-    container_name: gorse-server
-    depends_on:
-      - gorse-master
-    ports:
-      - "8087:8087"
+| Service / Container | Port | Purpose / Notes |
+|---------------------|------|------------------|
+| `gorse-mysql`       | 3306 | Metadata DB for Gorse engine |
+| `gorse-redis`       | 6379 | Cache + trending items & fast data access |
+| `gorse-master`      | 8086 / 8088 | Gorse recommendation engine (master + dashboard) |
+| `gorse-server`      | 8087 | Gorse REST API server |
+| `mongo`             | 27017 | Storing user data, items/content for the Flask app |
 
-  mongo:
-    image: mongo:latest
-    container_name: gorse-mongo
-    ports:
-      - "27017:27017"
-    environment:
-      MONGO_INITDB_ROOT_USERNAME: root
-      MONGO_INITDB_ROOT_PASSWORD: Mani@2003
+Example `docker-compose.yml` is already provided in the repo.
 
-volumes:
-  gorse-mysql-data:
+---
+
+## ⚙️ Flask App Configuration & Running
+
+1. Install Python dependencies:
+   ```bash
+   pip install -r requirements.txt
 ````
 
----
+2. Configure environment variables or edit `config.py`:
 
-## **4. Flask App Configuration**
+   ```python
+   # Example settings
+   DB_USER = 'gorse_user'
+   DB_PASSWORD = 'gorse_pass'
+   DB_HOST = 'gorse-mysql'
+   DB_NAME = 'gorse'
+   SQLALCHEMY_DATABASE_URI = f"mysql+pymysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}/{DB_NAME}"
 
-* Install requirements:
+   MONGO_USER = 'root'
+   MONGO_PASS = 'your_mongo_password'
+   MONGO_HOST = 'mongo'
+   MONGO_PORT = 27017
+   MONGO_DB = 'gorse_app'
 
-```bash
-pip install -r requirements.txt
-```
+   REDIS_HOST = 'gorse-redis'
+   REDIS_PORT = 6379
+   ```
+3. Start the Flask app:
 
-* `.env` or `config.py` settings:
+   ```bash
+   python app.py
+   ```
 
-```python
-# MySQL / Gorse
-DB_USER = 'gorse_user'
-DB_PASSWORD = 'gorse_pass'
-DB_HOST = 'gorse-mysql'
-DB_NAME = 'gorse'
-SQLALCHEMY_DATABASE_URI = f"mysql+pymysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}/{DB_NAME}"
+### 📡 API Endpoints
 
-# MongoDB
-MONGO_USER = 'root'
-MONGO_PASS = 'Mani@2003'
-MONGO_HOST = 'mongo'
-MONGO_PORT = 27017
-MONGO_DB = 'gorse_app'
-
-# Redis
-REDIS_HOST = 'gorse-redis'
-REDIS_PORT = 6379
-```
-
-* Flask app run:
-
-```bash
-python app.py
-```
-
-* API Endpoints:
-
-| Endpoint               | Method | Description          |
-| ---------------------- | ------ | -------------------- |
-| `/add_user`            | POST   | Add a user           |
-| `/add_item`            | POST   | Add item/content     |
-| `/feedback`            | POST   | Submit user feedback |
-| `/activity`            | POST   | Log user activity    |
-| `/recommend/<user_id>` | GET    | Get recommendations  |
+| Endpoint               | Method | Description                                       |
+| ---------------------- | ------ | ------------------------------------------------- |
+| `/add_user`            | POST   | Add/register a new user                           |
+| `/add_item`            | POST   | Add a new item/content                            |
+| `/feedback`            | POST   | Submit user feedback (like / dislike / view etc.) |
+| `/activity`            | POST   | Log user activity (optional)                      |
+| `/recommend/<user_id>` | GET    | Get recommended items for the given user          |
 
 ---
 
-## **5. Requirements (requirements.txt)**
+## 📄 Sample `requirements.txt`
 
-```txt
+```text
 Flask==2.3.4
 Flask-SQLAlchemy==3.0.5
 pymysql==1.1.1
@@ -149,25 +101,24 @@ python-dotenv==1.0.1
 
 ---
 
-## **6. Notes for Production**
+## ✅ Production / Deployment Notes
 
-1. **Docker Network**: Ensure all services are in same Docker network for hostname connectivity (`gorse-mysql`, `gorse-redis`, `mongo`, etc.)
-2. **Separate DB per user (Optional)**: Use `get_user_db(user_id)` to maintain user-specific MongoDB databases.
-3. **Gorse Configuration**: `config.toml` must match the Docker service hostnames.
-4. **Security**: Replace default passwords, enable SSL for Redis/MySQL in production.
-5. **Scaling**: Gorse workers and servers can be scaled for higher throughput.
-
-```
+* Ensure all services (MySQL, Redis, Mongo, Gorse) are on the same Docker network so hostnames resolve as configured
+* Use strong credentials instead of defaults — especially for MySQL & Mongo
+* Consider enabling SSL / TLS for external-facing services (DB, Redis)
+* For scalability: scale Gorse worker/server containers depending on load
+* Use separate databases per user or logical partitioning (optional) for multi-tenant / user-specific data
 
 ---
 
-✅ **Summary:**
+## 🔍 About
 
-- Ithu **full production setup** for **Gorse + Flask + MongoDB + Redis**.
-- Requirements file ready (`requirements.txt`).
-- All hostnames & ports match **Docker network**.  
-- Flask app can log **per-user activity**, fetch recommendations from **Gorse**, and store content/user data in MongoDB.
+This project integrates the power of Gorse (a scalable open-source recommendation engine) with a Flask-based web interface + MongoDB data store, allowing easy customization, extension, and production deployments.
 
 ---
+
+## 📝 License & Contributions
+
+Feel free to use, modify, and contribute. Pull requests and issues are welcome.
 
 
