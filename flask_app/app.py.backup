@@ -1,0 +1,558 @@
+import os
+import logging
+from datetime import datetime, timedelta
+from urllib.parse import quote_plus
+import requests
+from flask import Flask, request, jsonify
+from pymongo import MongoClient
+from bson import ObjectId
+import redis
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("recommender")
+
+MONGO_USER = quote_plus(os.getenv("MONGO_USER", "root"))
+MONGO_PASS = quote_plus(os.getenv("MONGO_PASSWORD", "Mani@2003"))
+MONGO_HOST = os.getenv("MONGO_HOST", "127.0.0.1")  # local MongoDB
+MONGO_PORT = int(os.getenv("MONGO_PORT", 27017))
+MONGO_DBNAME = os.getenv("MONGO_DB", "gorse_app")
+MONGO_URI = f"mongodb://{MONGO_USER}:{MONGO_PASS}@127.0.0.1:27017/gorse_app"
+log.info("Using Mongo URI: %s", MONGO_URI.replace(MONGO_PASS, "*"))
+
+GORSE_URL = os.getenv("GORSE_URL", "http://localhost:8087/api")
+
+# Redis (for trending)
+REDIS_HOST = os.getenv("REDIS_HOST", "redis")
+REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
+# Other
+PORT = int(os.getenv("PORT", 5000))
+
+# ---------------- Connections ----------------
+mongo_client = MongoClient(MONGO_URI)
+db = mongo_client['gorse_app']
+
+# Global shared collections (single DB)
+users_col = db["users"]
+items_col = db["items"]
+likes_col = db["likes"]
+watch_col = db["watch_history"]
+follows_col = db["follows"]
+interests_col = db["user_interests"]
+interactions_col = db["interactions"]        # local recording of interactions sent to Gorse
+related_items_col = db["related_items"]
+activity_col = db["users_daily_activity"]
+
+redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+
+app = Flask(__name__)
+
+def get_user_db(user_id):
+    return db
+
+# ---------------- Helpers ----------------
+def now_iso():
+    return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def safe_json(resp):
+    try:
+        return resp.json()
+    except Exception:
+        return {}
+
+def parse_gorse_items(resp):
+    """
+    Normalize gorse response to list of dicts with item_id and cf_score
+    Gorse gateway often returns list of item ids or dicts depending on endpoint.
+    """
+    try:
+        data = resp.json()
+    except Exception:
+        return []
+    if isinstance(data, list):
+        # each element might be a string id or dict
+        normalized = []
+        for it in data:
+            if isinstance(it, dict):
+                iid = it.get("Id") or it.get("ItemId") or it.get("item_id") or it.get("id")
+                score = it.get("Score") or it.get("score") or 0
+                normalized.append({"item_id": iid, "cf_score": float(score)})
+            else:
+                normalized.append({"item_id": it, "cf_score": 0.0})
+        return normalized
+    if isinstance(data, dict):
+        # possible shapes: {"Items": [...]} or {"items": [...]}
+        items = data.get("Items") or data.get("items") or []
+        return parse_gorse_items(requests.models.Response()._replace()) if not items else parse_gorse_items(type('R', (), {"json": lambda: items})())
+    return []
+
+# ---------------- Gorse integration ----------------
+def send_feedback_to_gorse(user_id, item_id, feedback_type="like", timestamp=None):
+    payload = [{
+        "FeedbackType": feedback_type,
+        "UserId": str(user_id),
+        "ItemId": str(item_id),
+        "Timestamp": timestamp or now_iso(),
+    }]
+    try:
+        r = requests.post(f"{GORSE_URL}/feedback", json=payload, timeout=5)
+        if r.status_code not in (200, 201):
+            log.warning("Gorse feedback returned %s: %s", r.status_code, r.text[:200])
+    except Exception as e:
+        log.exception("Gorse feedback failed: %s", e)
+
+def get_gorse_recommendations(user_id, n=20):
+    try:
+        r = requests.get(f"{GORSE_URL}/recommend/{user_id}", params={"n": n}, timeout=6)
+        if r.status_code == 200:
+            return parse_gorse_items(r)
+        else:
+            log.warning("Gorse recommend status %s: %s", r.status_code, r.text[:200])
+            return []
+    except Exception as e:
+        log.exception("Gorse recommend error: %s", e)
+        return []
+
+# ---------------- Data sync / store ----------------
+def store_local_interaction(user_id, item_id, typ, extra=None):
+    doc = {
+        "user_id": str(user_id),
+        "item_id": str(item_id),
+        "type": typ,
+        "extra": extra or {},
+        "timestamp": datetime.utcnow()
+    }
+    try:
+        interactions_col.insert_one(doc)
+    except Exception as e:
+        log.exception("store_local_interaction error: %s", e)
+
+def update_popularity_from_redis(item_id):
+    try:
+        score = redis_client.zscore("trending_items", item_id) or 0
+        items_col.update_one({"item_id": item_id}, {"$set": {"popularity_score": float(score)}}, upsert=True)
+    except Exception as e:
+        log.exception("update_popularity error: %s", e)
+
+# ---------------- Candidate generators ----------------
+def candidate_interest(user_id, limit=30):
+    """Items matching user's explicit interests/tags."""
+    ui = interests_col.find_one({"user_id": str(user_id)})
+    if not ui:
+        return []
+    tags = ui.get("interests", []) or []
+    if not tags:
+        return []
+    cursor = items_col.find({"tags": {"$in": tags}}).limit(limit)
+    out = []
+    for it in cursor:
+        out.append({
+            "item_id": it["item_id"],
+            "content_score": 0.7,
+            "category": it.get("category", "general"),
+            "popularity_score": it.get("popularity_score", 0)
+        })
+    return out
+
+def candidate_followed_users(user_id, limit=30):
+    """Items posted by users/pages this user follows."""
+    follows = follows_col.find({"follower_id": str(user_id)})
+    followed = [f.get("followed_id") for f in follows]
+    if not followed:
+        return []
+    cursor = items_col.find({"creator_id": {"$in": followed}}).limit(limit)
+    out = []
+    for it in cursor:
+        out.append({
+            "item_id": it["item_id"],
+            "content_score": 0.6,
+            "category": it.get("category", "general"),
+            "popularity_score": it.get("popularity_score", 0)
+        })
+    return out
+
+def candidate_social_boost(user_id):
+    """Items liked/viewed by user's network (friends). Returns list with social_score."""
+    follows = follows_col.find({"follower_id": str(user_id)})
+    friends = [f.get("followed_id") for f in follows]
+    if not friends:
+        return []
+    candidate_scores = {}
+    # friends likes
+    for l in likes_col.find({"user_id": {"$in": friends}}):
+        iid = l.get("item_id")
+        candidate_scores[iid] = candidate_scores.get(iid, 0) + 0.25
+    # friends watch_time > 5
+    for w in watch_col.find({"user_id": {"$in": friends}, "watch_time": {"$gte": 5}}):
+        iid = w.get("item_id")
+        candidate_scores[iid] = candidate_scores.get(iid, 0) + 0.35
+    # posts by friends
+    for p in items_col.find({"creator_id": {"$in": friends}}):
+        iid = p.get("item_id")
+        candidate_scores[iid] = candidate_scores.get(iid, 0) + 0.1
+    return [{"item_id": k, "social_score": v} for k, v in candidate_scores.items()]
+
+# ---------------- Scoring (hybrid) ----------------
+def compute_recency_score(item_doc):
+    ts = item_doc.get("timestamp")
+    if not ts:
+        return 0.2
+    if isinstance(ts, str):
+        try:
+            ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        except Exception:
+            ts = datetime.utcnow()
+    age_hours = (datetime.utcnow() - ts).total_seconds() / 3600.0
+    if age_hours < 1:
+        return 1.0
+    if age_hours < 24:
+        return 0.8
+    if age_hours < 72:
+        return 0.5
+    return 0.2
+
+def compute_hybrid(user_id, candidates):
+    """
+    candidates: list of dicts where each dict may include:
+      item_id, cf_score, content_score, popularity_score, category, feed_data
+    returns scored list sorted desc
+    """
+   
+    feeds_col = db["feeds"]  # ← Add this
+    
+    # social map for boosts
+    social_map = {c["item_id"]: c.get("social_score", 0) for c in candidate_social_boost(user_id)}
+    scored = []
+    
+    for c in candidates:
+        iid = c["item_id"]
+        
+        # Try to get from feed_data first (already fetched), then items_col
+        if "feed_data" in c:
+            item_doc = c["feed_data"]
+            popularity = float(item_doc.get("decayedPopularityScore", 0) or 0)
+        else:
+            # Fallback to items collection or try feeds collection
+            item_doc = items_col.find_one({"item_id": iid})
+            if not item_doc:
+                try:
+                    if ObjectId.is_valid(iid):
+                        item_doc = feeds_col.find_one({"_id": ObjectId(iid)}) or {}
+                        popularity = float(item_doc.get("decayedPopularityScore", 0) or 0)
+                    else:
+                        item_doc = {}
+                        popularity = 0.0
+                except:
+                    item_doc = {}
+                    popularity = 0.0
+            else:
+                popularity = float(item_doc.get("popularity_score", 0))
+        
+        cf = float(c.get("cf_score", 0))
+        content = float(c.get("content_score", 0))
+        popularity = float(c.get("popularity_score", popularity))
+        recency = compute_recency_score(item_doc)
+        
+        # watch-time boost
+        watch = watch_col.find_one({"user_id": str(user_id), "item_id": iid}) or {}
+        watch_boost = 1.2 if watch.get("watch_time", 0) >= 5 else 1.0
+        
+        # friend boost
+        friend_boost = social_map.get(iid, 0)
+        
+        # final weighted score
+        final = (
+            0.45 * cf +
+            0.25 * content +
+            0.15 * recency +
+            0.10 * popularity +
+            0.05 * (c.get("search_score", 0))
+        )
+        final = final * watch_boost + friend_boost
+        
+        scored.append({
+            "item_id": iid,
+            "score": round(float(final), 6),
+            "category": c.get("category", item_doc.get("category", "general")),
+            "popularity": popularity
+        })
+    
+    return sorted(scored, key=lambda x: x["score"], reverse=True)
+
+# ---------------- Utilities: merge/dedupe candidates ----------------
+def merge_candidates(candidate_lists):
+    merged = {}
+    for list_ in candidate_lists:
+        for c in list_:
+            iid = c["item_id"]
+            merged[iid] = {**merged.get(iid, {}), **c}
+    return list(merged.values())
+
+# ---------------- Endpoints ----------------
+@app.route("/")
+def home():
+    return "Recommender_APP (GORSE RECOMMENDATION ENGINE + FLASK CONNECTION)."
+
+# Replace your existing /recommend endpoint with this
+
+@app.route("/recommend/<user_id>", methods=["GET"])
+def recommend(user_id):
+    try:
+        from bson import ObjectId
+        
+        # Get feeds collection (your actual content)
+        feeds_col = db["feeds"]
+        
+        # 1) classic content candidates
+        cands = []
+        cands += candidate_interest(user_id, limit=30)
+        cands += candidate_followed_users(user_id, limit=30)
+
+        # 2) get collaborative results from Gorse
+        gorse_items = get_gorse_recommendations(user_id, n=40)
+        
+        # Fetch feed details from MongoDB for Gorse items
+        gorse_item_ids = [it["item_id"] for it in gorse_items]
+        try:
+            # Convert to ObjectId for feeds collection
+            gorse_object_ids = [ObjectId(iid) for iid in gorse_item_ids if ObjectId.is_valid(iid)]
+        except:
+            gorse_object_ids = []
+        
+        # Fetch feeds in batch
+        feeds_cursor = feeds_col.find({
+            "_id": {"$in": gorse_object_ids}, 
+            "status": "active"
+        })
+        feeds_map = {str(feed["_id"]): feed for feed in feeds_cursor}
+        
+        for it in gorse_items:
+            iid = it["item_id"]
+            
+            # Try to get from feeds collection first
+            feed = feeds_map.get(iid)
+            
+            if feed:
+                # Use real feed data
+                popularity = feed.get("decayedPopularityScore", 0.0) or 0.0
+                category = "post"  # or feed.get("type") based on your schema
+                
+                cands.append({
+                    "item_id": iid,
+                    "cf_score": float(it.get("cf_score", 0)),
+                    "category": category,
+                    "popularity_score": float(popularity),
+                    "feed_data": feed  # Store for later use
+                })
+            else:
+                # Fallback to items collection (legacy)
+                doc = items_col.find_one({"item_id": iid}) or {}
+                cands.append({
+                    "item_id": iid,
+                    "cf_score": float(it.get("cf_score", 0)),
+                    "category": doc.get("category", "general"),
+                    "popularity_score": doc.get("popularity_score", 0)
+                })
+
+        # 3) related items from related_items collection (co-visitation)
+        for r in related_items_col.find({"user_id": str(user_id)}).sort("score", -1).limit(20):
+            cands.append({
+                "item_id": r.get("related_item_id"),
+                "cf_score": float(r.get("score", 0))
+            })
+
+        # 4) social candidates (pull to include friend_score computation)
+        social = candidate_social_boost(user_id)
+        # add their social_score into candidates
+        for s in social:
+            cands.append({"item_id": s["item_id"], "social_score": s["social_score"]})
+
+        # 5) dedupe / merge candidates
+        merged = merge_candidates([cands])
+
+        # 6) compute hybrid scores
+        recommendations = compute_hybrid(user_id, merged)
+
+        # 7) attach "friend_liked_by" label: find friends who liked the item
+        friend_map = {}
+        follows = follows_col.find({"follower_id": str(user_id)})
+        friends = [str(f.get("followed_id")) for f in follows]
+        
+        if friends:
+            # Query your actual likes collection (with feedId)
+            for like in likes_col.find({"userId": {"$in": [ObjectId(f) for f in friends if ObjectId.is_valid(f)]}}):
+                feed_id = str(like.get("feedId"))
+                user_who_liked = str(like.get("userId"))
+                friend_map.setdefault(feed_id, []).append(user_who_liked)
+            
+            # Also check legacy item_id format
+            for like in likes_col.find({"user_id": {"$in": friends}}):
+                item_id = like.get("item_id")
+                friend_map.setdefault(item_id, []).append(like["user_id"])
+
+        # format top N
+        top_n = int(request.args.get("n", 20))
+        out = []
+        
+        for rec in recommendations[:top_n]:
+            iid = rec["item_id"]
+            
+            # Try to get feed metadata
+            feed = feeds_map.get(iid)
+            
+            recommendation = {
+                "item_id": iid,
+                "score": rec["score"],
+                "category": rec.get("category", "general"),
+                "friend_liked_by": friend_map.get(iid, []),
+                "popularity": rec.get("popularity", 0)
+            }
+            
+            # Add feed metadata if available
+            if feed:
+                recommendation["metadata"] = {
+                    "text": (feed.get("text") or "")[:100],
+                    "title": feed.get("title"),
+                    "likes": feed.get("likeCount", 0),
+                    "comments": feed.get("commentCount", 0),
+                    "created_at": feed["createdAt"].isoformat() if feed.get("createdAt") else None
+                }
+            
+            out.append(recommendation)
+
+        return jsonify({"user": user_id, "recommendations": out}), 200
+        
+    except Exception as e:
+        log.exception("recommend error: %s", e)
+        return jsonify({"error": str(e), "user": user_id, "recommendations": []}), 500
+@app.route("/add_user", methods=["POST"])
+def add_user():
+    try:
+        data = request.json or {}
+        uid = str(data.get("user_id") or data.get("_id"))
+        if not uid:
+            return jsonify({"error": "user_id required"}), 400
+        # normalize store
+        users_col.update_one({"user_id": uid}, {"$set": {
+            "user_id": uid,
+            "name": data.get("name"),
+            "bio": data.get("bio", ""),
+            "labels": data.get("labels", []),
+            "created_at": datetime.utcnow()
+        }}, upsert=True)
+        # send to Gorse best-effort
+        payload = {"UserId": uid, "Comment": data.get("bio", ""), "Labels": data.get("labels", []), "Subscribe": True}
+        try:
+            r = requests.post(f"{GORSE_URL}/user", json=payload, timeout=4)
+            if r.status_code not in (200, 201):
+                log.warning("Gorse add_user: %s %s", r.status_code, r.text[:200])
+        except Exception:
+            log.exception("gorse add_user failed")
+        return jsonify({"status": "ok"}), 201
+    except Exception as e:
+        log.exception("add_user error: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/add_item", methods=["POST"])
+def add_item():
+    try:
+        data = request.json or {}
+        iid = str(data.get("item_id") or data.get("_id"))
+        if not iid:
+            return jsonify({"error": "item_id required"}), 400
+        doc = {
+            "item_id": iid,
+            "creator_id": data.get("creator_id"),
+            "title": data.get("title") or data.get("caption", ""),
+            "category": data.get("category", data.get("media_type", "post")),
+            "tags": data.get("tags", []) or data.get("labels", []),
+            "timestamp": data.get("timestamp") or datetime.utcnow(),
+            "popularity_score": float(data.get("popularity_score", 0))
+        }
+        items_col.update_one({"item_id": iid}, {"$set": doc}, upsert=True)
+        # update popularity from redis immediately
+        update_popularity_from_redis(iid)
+        # send to Gorse
+        payload = {"ItemId": iid, "Comment": doc["title"], "Categories": [doc["category"]], "Labels": doc["tags"], "Timestamp": now_iso()}
+        try:
+            r = requests.post(f"{GORSE_URL}/item", json=payload, timeout=4)
+            if r.status_code not in (200, 201):
+                log.warning("Gorse add_item: %s %s", r.status_code, r.text[:200])
+        except Exception:
+            log.exception("gorse add_item failed")
+        return jsonify({"status": "ok"}), 201
+    except Exception as e:
+        log.exception("add_item error: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/feedback", methods=["POST"])
+def feedback():
+    """
+    Expected JSON: { "user_id": "...", "item_id": "...", "feedback_type": "like" }
+    """
+    try:
+        data = request.json or {}
+        user_id = str(data.get("user_id"))
+        item_id = str(data.get("item_id"))
+        fb = data.get("feedback_type", "like")
+        if not user_id or not item_id:
+            return jsonify({"error": "user_id and item_id required"}), 400
+        # store in app collections (likes or generic interactions)
+        if fb == "like":
+            likes_col.update_one({"user_id": user_id, "item_id": item_id}, {"$set": {"timestamp": datetime.utcnow()}}, upsert=True)
+        store_local_interaction(user_id, item_id, fb, extra={"source": "api"})
+        # send to Gorse
+        send_feedback_to_gorse(user_id, item_id, feedback_type=fb)
+        # bump trending
+        redis_client.zincrby("trending_items", 1, item_id)
+        update_popularity_from_redis(item_id)
+        return jsonify({"status": "ok"}), 201
+    except Exception as e:
+        log.exception("feedback error: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/activity", methods=["POST"])
+def activity():
+    """
+    Expected JSON: { "user_id": "...", "item_id": "...", "watch_time": 7 }
+    watch_time in seconds
+    """
+    try:
+        data = request.json or {}
+        user_id = str(data.get("user_id"))
+        item_id = str(data.get("item_id"))
+        watch_time = float(data.get("watch_time", 0))
+        if not user_id or not item_id:
+            return jsonify({"error": "user_id and item_id required"}), 400
+        # store watch record
+        watch_col.update_one({"user_id": user_id, "item_id": item_id}, {"$set": {"watch_time": watch_time, "timestamp": datetime.utcnow()}}, upsert=True)
+        activity_col.update_one({"user_id": user_id, "item_id": item_id}, {"$set": {"watch_time": watch_time, "timestamp": datetime.utcnow()}}, upsert=True)
+        # if watch_time >= 5 secs => considered a "view" feedback
+        if watch_time >= 5:
+            send_feedback_to_gorse(user_id, item_id, feedback_type="view")
+            store_local_interaction(user_id, item_id, "view", extra={"watch_time": watch_time})
+        # trending/popularity
+        redis_client.zincrby("trending_items", 1, item_id)
+        update_popularity_from_redis(item_id)
+        return jsonify({"status": "ok"}), 201
+    except Exception as e:
+        log.exception("activity error: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/debug/stats", methods=["GET"])
+def debug_stats():
+    try:
+        return jsonify({
+            "users": users_col.count_documents({}),
+            "items": items_col.count_documents({}),
+            "likes": likes_col.count_documents({}),
+            "interactions": interactions_col.count_documents({}),
+            "top_trending": redis_client.zrevrange("trending_items", 0, 9, withscores=True)
+        }), 200
+    except Exception as e:
+        log.exception("debug_stats error: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+# ---------------- Run ----------------
+if __name__ == "__main__":
+    log.info("Starting recommender on 0.0.0.0:%s", PORT)
+    app.run(host="0.0.0.0", port=PORT, debug=False)

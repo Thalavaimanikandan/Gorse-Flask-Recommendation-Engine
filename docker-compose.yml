@@ -1,0 +1,109 @@
+version: '3'
+
+networks:
+  gorse-network:
+    driver: bridge
+
+services:
+  mysql:
+    image: mysql:8
+    container_name: gorse-mysql
+    networks:
+      - gorse-network
+    environment:
+      MYSQL_ROOT_PASSWORD: root_pass
+      MYSQL_DATABASE: gorse
+      MYSQL_USER: gorse
+      MYSQL_PASSWORD: gorse_pass
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      timeout: 20s
+      retries: 10
+
+  redis:
+    image: redis:alpine
+    container_name: gorse-redis
+    networks:
+      - gorse-network
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  master:
+    image: zhenghaoz/gorse-master
+    container_name: gorse-master
+    networks:
+      - gorse-network
+    ports:
+      - "9090:8088"
+      - "8088:8088"
+    volumes:
+      - ./config.toml:/etc/gorse/config.toml
+    command: 
+      - "-c"
+      - "/etc/gorse/config.toml"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  server:
+    image: zhenghaoz/gorse-server
+    container_name: gorse-server
+    networks:
+      - gorse-network
+    ports:
+      - "8087:8087"
+    environment:
+      # Pass database config via environment
+      GORSE_CACHE_STORE: "redis://gorse-redis:6379/0"
+      GORSE_DATA_STORE: "mysql://gorse:gorse_pass@tcp(gorse-mysql:3306)/gorse?parseTime=true"
+    command:
+      - "--master-host"
+      - "gorse-master"
+      - "--master-port"
+      - "8086"
+      - "--http-host"
+      - "0.0.0.0"
+      - "--http-port"
+      - "8087"
+    depends_on:
+      - master
+      - mysql
+      - redis
+    restart: unless-stopped
+
+  worker:
+    image: zhenghaoz/gorse-worker
+    container_name: gorse-worker
+    networks:
+      - gorse-network
+    environment:
+      # Pass database config via environment
+        GORSE_CACHE_STORE: "redis://host.docker.internal:6379/0"
+        GORSE_DATA_STORE: "mysql://gorse:gorse_pass@tcp(gorse-mysql:3306)/gorse?parseTime=true"
+    command:
+      - "--master-host"
+      - "gorse-master"
+      - "--master-port"
+      - "8086"
+      - "-j"
+      - "1"
+    depends_on:
+      - master
+      - mysql
+      - redis
+    restart: unless-stopped
+
+volumes:
+  mysql_data:

@@ -1,0 +1,39 @@
+[master]
+port = 8086
+host = "0.0.0.0"
+n_jobs = 1
+meta_timeout = 10
+
+[server]
+default_n = 10
+api_key = ""
+
+[database]
+data_store = "mysql://gorse:gorse_pass@tcp(gorse-mysql:3306)/gorse?parseTime=true"
+cache_store = "redis://gorse-redis:6379/0"
+
+[recommend]
+cache_size = 100
+cache_expire = "72h"
+
+[recommend.data_source]
+positive_feedback_types = ["read", "like", "favorite"]
+read_feedback_types = ["read"]
+positive_feedback_ttl = 0
+item_ttl = 0
+
+[recommend.popular]
+popular_window = "720h"
+
+[recommend.collaborative]
+model_fit_period = "60m"
+model_search_period = "360m"
+
+[recommend.offline]
+check_recommend_period = "1m"
+refresh_recommend_period = "24h"
+enable_collaborative_recommend = true
+
+[recommend.online]
+fallback_recommend = ["latest"]
+num_feedback_fallback_item_based = 10
